@@ -54,28 +54,32 @@ jobs:
           pip3 install --quiet --upgrade yt-dlp requests
 
       # ─────────────────────────────────────────
-      - name: Validate inputs
+      - name: Validate and normalise inputs
         id: validate
         run: |
           python3 << 'PYEOF'
           import os, sys, re
 
-          url   = os.environ.get('INPUT_URL', '').strip()
-          fmt   = os.environ.get('INPUT_FORMAT', 'mp4')
-          qual  = os.environ.get('INPUT_QUALITY', '').strip()
+          url    = os.environ.get('INPUT_URL', '').strip()
+          fmt    = os.environ.get('INPUT_FORMAT', 'mp4').strip()
+          qual   = os.environ.get('INPUT_QUALITY', '').strip()
           folder = os.environ.get('INPUT_FOLDER', 'downloads').strip()
 
-          # ── URL check ──────────────────────────────────────
+          # Strip accidental markdown bold/italic wrapping (**url**)
+          url = url.strip('*_ \t')
+
+          # Accept any youtube.com or youtu.be link (including ?si= sharing params)
           yt_pattern = re.compile(
-              r'(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/|playlist\?list=)|youtu\.be/)[\w\-?=&%]+'
+              r'https?://(www\.)?(youtube\.com|youtu\.be)/\S+',
+              re.IGNORECASE,
           )
           if not yt_pattern.match(url):
-              print("::error::Invalid YouTube URL. Supported: watch, shorts, playlist, youtu.be")
+              print(f"::error::Invalid YouTube URL: '{url}'")
               sys.exit(1)
 
-          # ── Quality defaults ───────────────────────────────
-          valid_video  = ('144p','360p','480p','720p','1080p','1440p','2160p')
-          valid_audio  = ('64kbps','128kbps','192kbps','320kbps')
+          # Quality defaults
+          valid_video = ('144p','360p','480p','720p','1080p','1440p','2160p')
+          valid_audio = ('64kbps','128kbps','192kbps','320kbps')
 
           if fmt == 'mp3':
               if qual not in valid_audio:
@@ -84,12 +88,11 @@ jobs:
               if qual not in valid_video:
                   qual = '720p'
 
-          # ── Folder safety ──────────────────────────────────
+          # Folder safety
           folder = re.sub(r'[^a-zA-Z0-9_\-/]', '_', folder).strip('/')
           if not folder:
               folder = 'downloads'
 
-          # Write outputs for next steps
           with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
               fh.write(f"url={url}\n")
               fh.write(f"fmt={fmt}\n")
@@ -102,8 +105,8 @@ jobs:
           print(f"✅  Folder  : {folder}")
           PYEOF
         env:
-          INPUT_URL:    ${{ github.event.inputs.video_url }}
-          INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
+          INPUT_URL:     ${{ github.event.inputs.video_url }}
+          INPUT_FORMAT:  ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
           INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
           INPUT_FOLDER:  ${{ github.event.inputs.output_folder }}
 
@@ -112,7 +115,7 @@ jobs:
         id: download
         run: |
           python3 << 'PYEOF'
-          import os, sys, subprocess, json, re, shutil
+          import os, sys, subprocess, shutil
 
           url     = "${{ steps.validate.outputs.url }}"
           fmt     = "${{ steps.validate.outputs.fmt }}"
@@ -121,61 +124,79 @@ jobs:
           tmp_dir = os.path.join(folder, ".tmp_dl")
           os.makedirs(tmp_dir, exist_ok=True)
 
-          # ── Build yt-dlp command ───────────────────────────
+          out_tmpl = os.path.join(tmp_dir, "%(title).80s [%(id)s].%(ext)s")
+
+          base = [
+              "yt-dlp",
+              "--no-playlist",
+              "--embed-thumbnail",
+              "--add-metadata",
+              "--restrict-filenames",
+              "--no-warnings",
+              "--progress",
+              "-o", out_tmpl,
+          ]
+
           if fmt == "mp3":
               bitrate = quality.replace("kbps", "")
-              cmd = [
-                  "yt-dlp",
-                  "--no-playlist",          # single video unless playlist URL
-                  "-x",                     # extract audio
+              cmd = base + [
+                  "-x",
                   "--audio-format", "mp3",
                   "--audio-quality", bitrate,
-                  "--embed-thumbnail",
-                  "--add-metadata",
-                  "--no-warnings",
-                  "--restrict-filenames",
-                  "-o", os.path.join(tmp_dir, "%(title).80s [%(id)s].%(ext)s"),
                   url,
               ]
           else:
-              # height from e.g. "720p" → 720
-              height = quality.rstrip('p')
-              # Best video up to requested height + best audio, merged to mp4
-              fmt_selector = (
-                  f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]"
-                  f"/bestvideo[height<={height}]+bestaudio"
-                  f"/best[height<={height}]"
-                  f"/best"
-              )
-              cmd = [
-                  "yt-dlp",
-                  "--no-playlist",
-                  "-f", fmt_selector,
+              height = quality.rstrip("p")
+              # Broad fallback chain — handles geo-restrictions and missing codecs
+              fmt_sel = "/".join([
+                  f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]",
+                  f"bestvideo[height<={height}]+bestaudio[ext=m4a]",
+                  f"bestvideo[height<={height}]+bestaudio",
+                  f"best[height<={height}][ext=mp4]",
+                  f"best[height<={height}]",
+                  "bestvideo+bestaudio",
+                  "best",
+              ])
+              cmd = base + [
+                  "-f", fmt_sel,
                   "--merge-output-format", "mp4",
-                  "--embed-thumbnail",
-                  "--add-metadata",
-                  "--no-warnings",
-                  "--restrict-filenames",
-                  "-o", os.path.join(tmp_dir, "%(title).80s [%(id)s].%(ext)s"),
                   url,
               ]
 
-          print(f"▶  Running: {' '.join(cmd)}")
-          result = subprocess.run(cmd, capture_output=False, text=True)
+          print(f"▶  Running yt-dlp …\n   URL     : {url}")
+          print(f"   Format  : {fmt}  |  Quality: {quality}\n")
+
+          result = subprocess.run(cmd)
 
           if result.returncode != 0:
-              print("::error::yt-dlp failed. Check the URL or try a different quality.")
-              sys.exit(1)
+              # Last-resort fallback — just grab whatever yt-dlp can find
+              print("\n⚠️  Primary format selector failed → retrying with best/fallback …")
+              fallback = [
+                  "yt-dlp",
+                  "--no-playlist",
+                  "--restrict-filenames",
+                  "--no-warnings",
+                  "--progress",
+                  "-f", "bv*+ba/b",   # yt-dlp native shorthand: best video+audio or best combined
+                  "--merge-output-format", "mp4",
+                  "-o", out_tmpl,
+                  url,
+              ]
+              result2 = subprocess.run(fallback)
+              if result2.returncode != 0:
+                  print("::error::yt-dlp failed on both attempts. Verify the URL is public and not age-restricted.")
+                  sys.exit(1)
 
-          # ── Find downloaded file ───────────────────────────
+          # Find downloaded file
           files = [f for f in os.listdir(tmp_dir) if os.path.isfile(os.path.join(tmp_dir, f))]
           if not files:
-              print("::error::No file found after download.")
+              print("::error::No output file found after download.")
               sys.exit(1)
 
           downloaded = files[0]
           size_mb = os.path.getsize(os.path.join(tmp_dir, downloaded)) / (1024 * 1024)
-          print(f"✅  Downloaded: {downloaded}  ({size_mb:.1f} MB)")
+          print(f"\n✅  File    : {downloaded}")
+          print(f"✅  Size    : {size_mb:.1f} MB")
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
               fh.write(f"filename={downloaded}\n")
@@ -194,55 +215,51 @@ jobs:
           filename = "${{ steps.download.outputs.filename }}"
           size_mb  = float("${{ steps.download.outputs.size_mb }}")
 
-          # ── Determine threshold ────────────────────────────
           raw = "${{ github.event.inputs.max_part_mb }}".strip()
           try:
-              thresh = int(raw)
-          except ValueError:
+              thresh = int(float(raw))
+          except (ValueError, TypeError):
               thresh = 0
 
-          # Always cap at 95 to stay under GitHub's 100 MB limit
+          # Always stay under GitHub's 100 MB file limit
           if thresh <= 0 or thresh > 95:
               thresh = 95
 
           src = os.path.join(tmp_dir, filename)
 
           if size_mb > thresh:
-              print(f"📦  File is {size_mb:.1f} MB → splitting into {thresh} MB parts")
+              print(f"📦  {size_mb:.1f} MB > {thresh} MB → splitting into parts")
               zip_base = os.path.join(folder, filename + ".zip")
               subprocess.run(
                   ["zip", "-r", "-s", f"{thresh}m", zip_base, "--", src],
                   check=True,
               )
-
-              # List created parts for the log
               parts = sorted([
                   f for f in os.listdir(folder)
                   if f.startswith(filename + ".z") or f == filename + ".zip"
               ])
-              print(f"✅  Created {len(parts)} part(s): {parts}")
+              print(f"✅  {len(parts)} part(s): {parts}")
 
-              # Write a README so users know how to reassemble
               readme = os.path.join(folder, f"HOW_TO_JOIN_{filename}.txt")
               with open(readme, "w") as fh:
                   fh.write(
-                      f"To reassemble '{filename}' download ALL parts:\n"
+                      f"To reassemble '{filename}', download ALL parts:\n"
                       + "\n".join(f"  {p}" for p in parts)
-                      + "\n\nThen run (Linux/macOS):\n"
+                      + "\n\nLinux / macOS:\n"
                       + f"  zip -FF {filename}.zip --out full.zip && unzip full.zip\n\n"
-                      + "Or (Windows): use 7-Zip → open the .zip file directly.\n"
+                      + "Windows:\n"
+                      + "  Open the .zip file with 7-Zip.\n"
                   )
           else:
-              print(f"📁  File is {size_mb:.1f} MB → moving directly (no split needed)")
+              print(f"📁  {size_mb:.1f} MB ≤ {thresh} MB → moving directly")
               shutil.move(src, os.path.join(folder, filename))
 
-          # Cleanup temp dir
           shutil.rmtree(tmp_dir, ignore_errors=True)
           print("✅  Done")
           PYEOF
 
       # ─────────────────────────────────────────
-      - name: Commit and push to repository
+      - name: Commit and push
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -257,7 +274,7 @@ jobs:
             SIZE="${{ steps.download.outputs.size_mb }}"
             FMT="${{ steps.validate.outputs.fmt }}"
             QUAL="${{ steps.validate.outputs.quality }}"
-            git commit -m "⬇️ YouTube ${FMT^^} – ${FNAME} (${SIZE} MB, ${QUAL}) [skip ci]"
+            git commit -m "⬇️ YT ${FMT^^} – ${FNAME} (${SIZE} MB, ${QUAL}) [skip ci]"
             git push
             echo "✅  Pushed to $FOLDER/"
           fi
